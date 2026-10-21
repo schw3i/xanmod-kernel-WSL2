@@ -9,6 +9,19 @@ on:
       version_suffix: # (main)/lts/rt
         type: string
         default: ""
+      arch:
+        type: string
+        default: "MZEN3"
+      image_name:
+        type: string
+        default: ""
+
+concurrency:
+  group: xanmod-${{ inputs.branch }}-${{ inputs.arch }}-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   MIMALLOC_ALLOW_LARGE_OS_PAGES: 1
@@ -16,173 +29,213 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     container:
       image: cachyos/cachyos-v3:latest
     outputs:
-      current_version: ${{ steps.out.outputs.current_version }}
-      release_version: ${{ steps.out.outputs.release_version }}
-      clang_version: ${{ steps.out.outputs.clang_version }}
-      rebuild_flag: ${{ steps.out.outputs.rebuild_flag }}
-
-    env:
-      CURRENT_VERSION:
-      RELEASED_VERSION:
-      CLANG_VERSION:
-      REBUILD_FLAG:
-
-    strategy:
-      matrix:
-        include:
-          - arch: GENERIC_CPU2
-            image-name: bzImage-x64v2
-          - arch: GENERIC_CPU3
-            image-name: bzImage-x64v3
-          - arch: MSKYLAKE
-            image-name: bzImage-skylake
-          - arch: MZEN3
-            image-name: bzImage-zen3
+      should_build: ${{ steps.check.outputs.should_build }}
+      should_release: ${{ steps.check.outputs.should_release }}
+      current_version: ${{ steps.check.outputs.current_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      clang_version: ${{ steps.check.outputs.clang_version }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      upstream_commit: ${{ steps.check.outputs.upstream_commit }}
+      builder_sha: ${{ steps.check.outputs.builder_sha }}
+      image_name: ${{ steps.check.outputs.image_name }}
+      config_features: ${{ steps.check.outputs.config_features }}
 
     steps:
-      - uses: actions/checkout@main
+      - name: Checkout repository
+        uses: actions/checkout@main
 
       - name: Install dependencies
-        id: dep
         run: |
-          pacman -Syu --noconfirm pahole xmlto inetutils bc cpio jq ccache git python go mimalloc clang llvm llvm-libs lld qemu-img rsync 7zip
-          # GOBIN=/usr/bin go install go.chromium.org/luci/cipd/client/cmd/...@latest
-          # cipd install fuchsia/third_party/clang/linux-amd64 latest -root /usr/local/fuchsia-clang
-          # echo "PATH=/usr/local/fuchsia-clang/bin:$PATH" >> $GITHUB_ENV
+          pacman -Syu --noconfirm --disable-sandbox-network pahole xmlto inetutils bc cpio jq ccache git python go mimalloc clang llvm llvm-libs lld qemu-img rsync 7zip
           echo "/usr/lib/libmimalloc.so" > /etc/ld.so.preload
 
       - name: Setup kernel source
         shell: bash
         run: |
-          git config --global --add safe.directory '*' # workaround for git safe.directory issue
-          ./scripts/setup.sh --arch ${{ matrix.arch }} --branch ${{ inputs.branch }}
+          git config --global --add safe.directory '*'
+          ./scripts/setup.sh --arch "${{ inputs.arch }}" --branch "${{ inputs.branch }}"
+
+      - name: Inspect source and determine release status
+        id: check
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global --add safe.directory '*'
+
+          IMAGE_NAME="${{ inputs.image_name }}"
+          if [ -z "$IMAGE_NAME" ]; then
+            case "${{ inputs.arch }}" in
+              GENERIC_CPU2) IMAGE_NAME="bzImage-x64v2" ;;
+              GENERIC_CPU3) IMAGE_NAME="bzImage-x64v3" ;;
+              MSKYLAKE)     IMAGE_NAME="bzImage-skylake" ;;
+              *)            IMAGE_NAME="bzImage-zen3" ;;
+            esac
+          fi
+
+          CLANG_VERSION=$(clang --version | head -n1)
+
           cd linux
 
-          # Load version info into env
-          echo "CLANG_VERSION=$(clang --version | head -n1)" | tee -a $GITHUB_ENV
+          CURRENT_VERSION=$(make -s LLVM=1 LLVM_IAS=1 kernelrelease)
 
-          export CURRENT_VERSION=$(make kernelrelease)
-          # must query with a token, or will fail with api rate limit on public runners
+          UPSTREAM_TAG=$(git describe --tags --exact-match 2>/dev/null)
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "Error: exact release tag could not be resolved from checked out source."
+            exit 1
+          fi
+          UPSTREAM_COMMIT=$(git rev-parse HEAD)
 
-          export RELEASED_VERSIONS=$(curl -sL -H 'Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}'\
-           https://api.github.com/repos/Locietta/xanmod-kernel-WSL2/tags\?per_page\=60 | jq -r '.[].name')
+          CONFIG_FEATURES=$(
+            echo "- Target CPU architecture: ${{ inputs.arch }} ($IMAGE_NAME)"
+            if grep -q "^CONFIG_DRM=y" .config && grep -q "^CONFIG_DRM_VGEM=y" .config; then
+              echo "- Built-in DRM and VGEM (CONFIG_DRM=y, CONFIG_DRM_VGEM=y) exposing /dev/dri"
+            fi
+            if grep -q "^CONFIG_MTRR=y" .config && grep -q "^CONFIG_X86_PAT=y" .config; then
+              echo "- Memory and page attribute support (CONFIG_MTRR=y, CONFIG_X86_PAT=y)"
+            fi
+            if grep -q "^CONFIG_DXGKRNL=y" .config; then
+              echo "- DirectX Graphics Kernel subsystem (CONFIG_DXGKRNL=y)"
+            fi
+          )
 
-          if [[ "${{ inputs.branch }}" = "MAIN" ]]; then
-            # NOTE: we have to exclude all other tags that are not main
-            export RELEASED_TAG=$(echo "$RELEASED_VERSIONS" | grep -v 'lts' | grep -v 'rt' | head -n 1)
+          cd ..
+          BUILDER_SHA=$(git rev-parse --short HEAD)
+
+          TAG_PARTS=("$CURRENT_VERSION")
+          if [ -n "${{ inputs.version_suffix }}" ]; then
+            TAG_PARTS+=("${{ inputs.version_suffix }}")
+          fi
+          if [ "${{ inputs.arch }}" != "MZEN3" ]; then
+            TAG_PARTS+=("${{ inputs.arch }}")
+          fi
+          TAG_PARTS+=("$BUILDER_SHA")
+
+          IFS="-"
+          RELEASE_TAG="${TAG_PARTS[*]}"
+          unset IFS
+
+          {
+            echo "image_name=$IMAGE_NAME"
+            echo "clang_version=$CLANG_VERSION"
+            echo "current_version=$CURRENT_VERSION"
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_commit=$UPSTREAM_COMMIT"
+            echo "builder_sha=$BUILDER_SHA"
+            echo "release_tag=$RELEASE_TAG"
+            echo "config_features<<EOF"
+            echo "$CONFIG_FEATURES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "Pull request: building for verification without release"
+            {
+              echo "should_build=true"
+              echo "should_release=false"
+            } >> "$GITHUB_OUTPUT"
           else
-            export RELEASED_TAG=$(echo "$RELEASED_VERSIONS" | grep "${{ inputs.version_suffix }}" | head -n 1)
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")
+            echo "Release tag check for $RELEASE_TAG returned HTTP $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Release $RELEASE_TAG already exists in $GITHUB_REPOSITORY. Skipping compilation."
+              {
+                echo "should_build=false"
+                echo "should_release=false"
+              } >> "$GITHUB_OUTPUT"
+            elif [ "$HTTP_CODE" = "404" ]; then
+              echo "Release $RELEASE_TAG not found. Will compile and release."
+              {
+                echo "should_build=true"
+                echo "should_release=true"
+              } >> "$GITHUB_OUTPUT"
+            else
+              echo "Error: unexpected status $HTTP_CODE querying GitHub API"
+              exit 1
+            fi
           fi
-
-          export RELEASED_VERSION=$(echo $RELEASED_TAG | sed "s#\(.*-locietta-WSL2-xanmod[0-9][0-9]*\).*#\1#" )
-          export RELEASED_MINOR=$(echo $RELEASED_TAG | sed "s#\(.*-locietta-WSL2-xanmod[0-9][0-9]*\).*\([0-9][0-9]*\).*#\2#" )
-
-          echo "CURRENT_VERSION=$CURRENT_VERSION" | tee -a $GITHUB_ENV
-          echo "RELEASED_VERSION=$RELEASED_VERSION" | tee -a $GITHUB_ENV
-
-          if [[ $CURRENT_VERSION != $RELEASED_VERSION || \
-                ($CURRENT_VERSION = $RELEASED_VERSION && 1 -gt "$RELEASED_MINOR") || \
-                "${{ github.event_name }}" = 'pull_request' || \
-                "${{ github.event_name }}" = 'workflow_dispatch' ]]; then
-            echo "REBUILD_FLAG=1" | tee -a $GITHUB_ENV
-          fi
-
       - name: Initialize ccache
         uses: Chocobo1/setup-ccache-action@master
-        if: ${{ env.REBUILD_FLAG }}
+        if: steps.check.outputs.should_build == 'true'
         with:
           prepend_symlinks_to_path: false
           update_packager_index: false
           install_ccache: false
-          override_cache_key: ${{ inputs.branch }}-${{ matrix.arch }}
+          override_cache_key: ${{ inputs.branch }}-${{ inputs.arch }}
           ccache_options: |
             max_size=2G
-            compiler_check=none
+            compiler_check=content
             compression=false
             sloppiness=locale,time_macros,pch_defines
 
       - name: Build kernel
-        if: ${{ env.REBUILD_FLAG }}
+        if: steps.check.outputs.should_build == 'true'
+        shell: bash
         run: |
-          cd linux && ../scripts/build.sh --branch ${{ inputs.branch }}
-          ../scripts/post-build.sh --name ${{ matrix.image-name }}
+          cd linux
+          ../scripts/build.sh --branch "${{ inputs.branch }}"
+          ../scripts/post-build.sh --name "${{ steps.check.outputs.image_name }}"
 
-      - name: Upload bzImage
+      - name: Upload artifacts
         uses: actions/upload-artifact@main
-        if: ${{ env.REBUILD_FLAG }}
+        if: steps.check.outputs.should_build == 'true'
         with:
-          name: ${{ matrix.image-name }}
+          name: ${{ steps.check.outputs.image_name }}
           include-hidden-files: true
           path: |
-            ${{ matrix.image-name }}
-            ${{ matrix.image-name }}-addons.vhdx.7z
-
-      - id: out
-        run: |
-          echo "current_version=${{ env.CURRENT_VERSION }}" >> $GITHUB_OUTPUT
-          echo "release_version=${{ env.RELEASED_VERSION }}" >> $GITHUB_OUTPUT
-          echo "clang_version=${{ env.CLANG_VERSION }}" >> $GITHUB_OUTPUT
-          echo "rebuild_flag=${{ env.REBUILD_FLAG }}" >> $GITHUB_OUTPUT
+            ${{ steps.check.outputs.image_name }}
+            ${{ steps.check.outputs.image_name }}-addons.vhdx.7z
 
   release:
     runs-on: ubuntu-latest
     needs: build
-    # PR from outside repo cannot create release, so we need to skip it
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name != 'pull_request' &&
+      needs.build.outputs.should_release == 'true'
     permissions:
       contents: write
 
-    env:
-      RELEASE_TAG:
-
     steps:
-      - uses: actions/checkout@main
-      - uses: actions/download-artifact@main
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Download artifacts
+        uses: actions/download-artifact@main
         with:
+          name: ${{ needs.build.outputs.image_name }}
           path: release_images/
-          merge-multiple: true
 
-      - id: fetch_commit_sha
-        run: |
-          if [ "${{ inputs.version_suffix }}" = '' ]; then
-            VERSION_SUFFIX=""
-          else
-            VERSION_SUFFIX="-${{ inputs.version_suffix }}"
-          fi
-
-          if [ "${{ github.event_name }}" = 'pull_request' ]; then
-            echo "sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
-            echo "RELEASE_TAG=${{ needs.build.outputs.current_version }}.1${VERSION_SUFFIX}-PR" | tee -a $GITHUB_ENV
-          else 
-            echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
-            echo "RELEASE_TAG=${{ needs.build.outputs.current_version }}.1${VERSION_SUFFIX}" | tee -a $GITHUB_ENV
-          fi
-
-      - name: Release
+      - name: Publish Release
         uses: softprops/action-gh-release@v3.0.1
-        if: ${{ needs.build.outputs.rebuild_flag }}
         with:
-          name: ${{ env.RELEASE_TAG }}
-          tag_name: ${{ env.RELEASE_TAG }}
-          draft: ${{ github.event_name == 'pull_request' }}
-          target_commitish: ${{ steps.fetch_commit_sha.outputs.sha }}
+          name: ${{ needs.build.outputs.release_tag }}
+          tag_name: ${{ needs.build.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: ${{ inputs.branch == 'MAIN' }}
           body: |
-            Latest XanMod ${{ inputs.branch }} kernel for WSL2, built with ${{ needs.build.outputs.clang_version }}.
-            Provide builds on different archs with matrix build utility of GitHub Action.
+            XanMod ${{ inputs.branch }} kernel for WSL2 (${{ inputs.arch }}), built with ${{ needs.build.outputs.clang_version }}.
 
-            * `bzImage-x64v{2,3}` for generic-x86_64-v{2,3}
-            * `bzImage-skylake` for intel skylake
-            * `bzImage-zen3` for AMD Zen3/Zen4
+            Configuration:
+            ${{ needs.build.outputs.config_features }}
+            Files:
+            - `${{ needs.build.outputs.image_name }}`: Kernel bzImage
+            - `${{ needs.build.outputs.image_name }}-addons.vhdx.7z`: Kernel modules, UAPI headers, and documentation VHDX
 
-            To check supported x86_64 level on your machine, see [how to check supported x86_64 level of the hardware](https://unix.stackexchange.com/questions/631217/how-do-i-check-if-my-cpu-supports-x86-64-v2?msclkid=42ca61e9aa7111ecbcab7bb1a4204357).
-
+            Source Provenance:
+            - Upstream XanMod release: ${{ needs.build.outputs.upstream_tag }} (commit ${{ needs.build.outputs.upstream_commit }})
+            - Builder revision: ${{ github.repository }}@${{ needs.build.outputs.builder_sha }}
           files: |
-            release_images/*
+            release_images/${{ needs.build.outputs.image_name }}
+            release_images/${{ needs.build.outputs.image_name }}-addons.vhdx.7z
           token: ${{ secrets.GITHUB_TOKEN }}
-          # generate_release_notes: true
           fail_on_unmatched_files: true

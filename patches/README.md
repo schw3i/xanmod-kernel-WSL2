@@ -1,8 +1,10 @@
 
-### Folder Structure
+# WSL compatibility patches
 
-* `.`: Patches applied to both MAIN and LTS builds
-* `MAIN`: Patches only applied to MAIN builds
-* `LTS`: Patches only applied to LTS builds
+- `.`: patches shared by MAIN and LTS.
+- `MAIN/`: patches for the current MAIN source series, Linux 7.2.
+- `LTS/`: patches for the LTS source series, Linux 6.18.
 
-Patch number will affect the applying order of the patch, no matter which folder it is located in. For example, `LTS/0003-bbrv3-fix-clang-build.patch` will be applied before `0004-nf_nat_fullcone-fix-clang-uninitialized-var-werror.patch`, if we are building the LTS kernel.
+`scripts/apply-patches.py` combines the common patches with the selected branch's patches and applies them in filename order.
+
+New XanMod kernel series can require patch updates. A rejected patch stops setup and prevents the workflow from publishing a kernel without its WSL compatibility changes.

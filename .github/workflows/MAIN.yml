@@ -6,12 +6,14 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
-    # manual trigger
   schedule:
-    - cron: '0 14 * * *'
+    - cron: '25 14 * * *'
 
 jobs:
   build-main:
+    permissions:
+      contents: write
     uses: ./.github/workflows/build-core.yml
     with:
       branch: MAIN
+      arch: MZEN3

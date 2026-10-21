@@ -1,141 +1,96 @@
 # xanmod-kernel-WSL2
 
-![Xanmod MAIN](https://github.com/Locietta/xanmod-kernel-WSL2/actions/workflows/MAIN.yml/badge.svg?branch=main)
-![Xanmod LTS](https://github.com/Locietta/xanmod-kernel-WSL2/actions/workflows/LTS.yml/badge.svg?branch=main)
-![](https://img.shields.io/github/license/Locietta/xanmod-kernel-WSL2)
-![version](https://img.shields.io/github/v/release/Locietta/xanmod-kernel-WSL2)
+![XanMod MAIN](https://github.com/schw3i/xanmod-kernel-WSL2/actions/workflows/MAIN.yml/badge.svg?branch=main)
+![Release](https://img.shields.io/github/v/release/schw3i/xanmod-kernel-WSL2)
 
-An **unofficial** [XanMod](https://gitlab.com/xanmod/linux) kernel port for **Windows Subsystem for Linux 2 (WSL2)**, featuring:
+An unofficial [XanMod](https://gitlab.com/xanmod/linux) kernel for WSL2, based on [Locietta's port](https://github.com/Locietta/xanmod-kernel-WSL2). This fork automatically builds the latest released **MAIN** kernel with **MZEN3** optimization for AMD Zen3/Zen4.
 
-- **Microsoft's dxgkrnl** patches for GPU support
-- **Compiled with Clang + ThinLTO** for additional optimizations
-- **Automated builds** via GitHub Actions (always up-to-date)
-- **Multiple CPU-optimized variants** (x64v2, x64v3, Skylake, Zen3)
+`/dev/dri/card0` and `/dev/dri/renderD128` are virtual DRM devices created by built-in VGEM. Their presence does not prove hardware rendering; WSL GPU acceleration also depends on dxgkrnl, the Windows GPU driver, Linux userspace, and the application's graphics backend. See [WSL issue #41792](https://github.com/microsoft/WSL/issues/41792).
 
-## Usage
+## Releases
 
-### Install via Scoop (Recommended)
+Download from [this fork's releases](https://github.com/schw3i/xanmod-kernel-WSL2/releases/latest):
 
-[scoop](https://scoop.sh/) is a command-line installer on windows that makes installation and update easy. We provide scoop manifests for this kernel in the [Locietta/sniffer](https://github.com/Locietta/sniffer) repository.
+| File | Contents |
+| --- | --- |
+| `bzImage-zen3` | MAIN kernel image for AMD Zen3/Zen4 |
+| `bzImage-zen3-addons.vhdx.7z` | Optional modules, prepared external-module headers, userspace API headers, and kernel documentation |
 
-#### Installation
+The upstream Scoop bucket installs upstream releases. Use this fork's release assets for the configuration described here.
+
+## Install manually
+
+Keep a known-good kernel and its matching addon VHDX for rollback. Installing a custom kernel affects all WSL2 distributions on the Windows host.
+
+1. Download `bzImage-zen3` and place it at a Windows path such as `C:\WSL\kernels\bzImage-zen3`.
+2. Create or edit `%UserProfile%\.wslconfig`:
+
+   ```ini
+   [wsl2]
+   kernel=C:\\WSL\\kernels\\bzImage-zen3
+   ```
+
+3. If you need the addon package, extract `bzImage-zen3-addons.vhdx.7z` beside the kernel. Under the same `[wsl2]` section, add:
+
+   ```ini
+   kernelModules=C:\\WSL\\kernels\\bzImage-zen3-addons.vhdx
+   ```
+
+   The addon must match the kernel release. WSL 2.5.1 or later is required for `kernelModules`. Remove an old `kernelModules` entry if you are installing only the kernel image.
+
+4. Save your work in WSL, then run in PowerShell:
+
+   ```powershell
+   wsl --shutdown
+   ```
+
+5. Start the distribution and check (`uname -r` reports the `-schw3i-WSL2` suffix):
+
+   ```bash
+   uname -r
+   ls -l /dev/dri
+   test -c /dev/dri/card0 && test -c /dev/dri/renderD128
+   ```
+
+There is no automatic Windows installation or WSL restart. To roll back, restore the previous `kernel` and matching `kernelModules` paths, or remove both overrides to use Microsoft's kernel, then shut down and restart WSL.
+
+See Microsoft's [.wslconfig documentation](https://learn.microsoft.com/en-us/windows/wsl/wsl-config#configure-global-options-with-wslconfig) for other settings.
+
+## Automated builds
+
+The MAIN workflow runs daily at 14:25 UTC, on pushes and pull requests to `main`, and through `workflow_dispatch`. Automatic builds target only `MZEN3`.
+
+Source setup checks out the newest release tag from XanMod's MAIN feed. A new upstream release or builder commit creates a build; an existing release skips compilation. Pull requests verify the build and never publish releases.
+
+MAIN releases publish as GitHub's latest release. LTS is available through manual dispatch only and does not replace the latest MAIN release.
+
+## Build locally
+
+Use an x86-64 Linux environment with the Clang/LLVM toolchain, kernel build dependencies, ccache, Python, rsync, `mke2fs`, `qemu-img`, and 7-Zip. The CI container and dependency installation are defined in [build-core.yml](.github/workflows/build-core.yml).
+
+From a fresh checkout:
 
 ```bash
-# Add the repository
-scoop bucket add sniffer https://github.com/Locietta/sniffer
-
-# Install kernel (alias to x64v3 variant, works for most modern CPUs)
-scoop install xanmod-WSL2
-
-# Optional: Install addons (extra modules, headers, documentation)
-scoop install xanmod-WSL2-addons
-
-# Restart WSL2 to apply
-wsl --shutdown
+./scripts/setup.sh --branch MAIN --arch MZEN3
+cd linux
+../scripts/build.sh --branch MAIN --jobs 4
+../scripts/post-build.sh --name bzImage-zen3
 ```
 
-**That's it!** Scoop automatically configures everything for you.
+Choose a job count that fits available memory. The final image and addon archive appear in the repository root. Packaging also compiles an external module and a userspace-header consumer against the prepared headers.
 
-<details>
-<summary>Expand all other builds</summary>
+Setup refuses to overwrite an existing `linux/` directory. `--no-download` uses an existing clean, unpatched source tree; it still applies the WSL patches and configuration. Preserve any work in a previous source tree before replacing it.
 
-```bash
-# other MAIN builds
-# scoop install xanmod-WSL2-{x64v2, x64v3, skylake, zen3}
-# scoop install xanmod-WSL2-addons-{x64v2, x64v3, skylake, zen3}
+The addon VHDX exposes these paths beneath `/lib/modules/$(uname -r)` in WSL:
 
-# LTS builds
-# scoop install xanmod-WSL2-lts # alias to xanmod-WSL2-lts-x64v3
-# scoop install xanmod-WSL2-lts-addons
-# scoop install xanmod-WSL2-lts-{x64v2, x64v3, skylake, zen3}
-# scoop install xanmod-WSL2-addons-lts-{x64v2, x64v3, skylake, zen3}
-```
-
-</details>
-
-#### Update kernel
-
-Run `scoop update *` to update all scoop installed apps including this kernel.
-
-We recommend to run `scoop update *` instead of `scoop update xanmod-WSL2` alone to make sure the addons package is also updated and in sync with the kernel.
-
-> **NOTE:** To make the kernel update applied, you have to reboot WSL2 after running scoop update!
-
-### Manual Installation
-
-It's also straightforward to manually install this kernel. For each arch, we release two files: the kernel image `bzImage` and an optional addon archive `bzImage-addons.vhdx.7z` that contains the VHDX with extra modules, headers and documentation.
-
-The manual installation steps are as follows:
-
-- Download kernel image from [releases](https://github.com/Locietta/xanmod-kernel-WSL2/releases)
-  - optionally, download the addon archive if you need extra modules/headers/docs, then extract the `.vhdx` file from it
-- Place it to somewhere appropriate. (e.g. `D:\.WSL\bzImage`)
-- Edit and save the `%UserProfile%\.wslconfig` with following content:
-
-```ini
-[wsl2]
-kernel = the\\path\\to\\bzImage
-kernelModules = the\\path\\to\\bzImage-addons.vhdx ; optional
-; e.g.
-; kernel = D:\\.WSL\\bzImage
-; kernelModules = D:\\.WSL\\bzImage-addons.vhdx
-;
-; Note that all `\` should be escaped with `\\`.
-```
-
-- Reboot your WSL2 to check your new kernel and enjoy!
-
-When the addon VHDX is configured, WSL exposes the packaged artifacts below
-`/lib/modules/$(uname -r)`:
-
-- `build/` is the prepared kbuild tree for compiling external kernel modules.
-- `build/usr/include/` contains the sanitized userspace API headers exported by
-  `make headers_install`.
-- `build/Documentation/` contains the documentation from the matching kernel
-  sources.
-
-## Troubleshooting
-
-### Changes not applied after installation or update?
-
-You must fully shut down WSL2 utill no WSL2 instances are running, then start it again to apply the new kernel.
-
-```powershell
-wsl --shutdown
-wsl --list --running  # Should show "no running distributions"
-```
-
-### Modules are not loaded to `/lib/modules`?
-
-Modules VHDX support is only available with WSL version **2.5.1** or later. Try running `wsl --version` to check your WSL version and use `wsl --update` to update WSL if needed.
-
-### Can't find `.wslconfig` file?
-
-It doesn't exist by default. Just create it manually in your user profile folder (e.g. `C:\Users\YourName\.wslconfig`).
-
-> For more information about `.wslconfig`, see microsoft's official [documentation](https://docs.microsoft.com/en-us/windows/wsl/wsl-config#configure-global-options-with-wslconfig).
-
-### Which architecture should I choose?
-
-If you are unsure whether to use x64v2 or x64v3, you can visit [xanmod.org](https://xanmod.org/). There's literally a table showing all the CPU models and their corresponding x86_64 psABI levels.
-
-You can also get a [checking script](https://dl.xanmod.org/check_x86-64_psabi.sh) from there.
-
-## Development
-
-🚧WIP
+- `build/`: the prepared kbuild tree for external modules.
+- `build/usr/include/`: sanitized userspace API headers, separate from the distribution's libc headers.
+- `build/Documentation/`: documentation from the matching kernel source.
 
 ## Credits
 
-- Linux community for the awesome OS kernel.
-- Microsoft for WSL2 and dxgkrnl patches.
-- XanMod project for various optimizations.
-- LLVM/Clang for the compiler infrastructure.
-
-## Contributing
-
-We welcome contributions! You can:
-
-- 🐛 Report bugs by opening an [issue](https://github.com/Locietta/xanmod-kernel-WSL2/issues/new?template=bug_report.yml)
-- 💡 Suggest features via [issues](https://github.com/Locietta/xanmod-kernel-WSL2/issues/new?template=feature-request.yml)
-- 🔧 Submit improvements through [pull requests](https://github.com/Locietta/xanmod-kernel-WSL2/pulls)
+- Locietta and contributors for the original XanMod WSL2 port.
+- The Linux community for the kernel.
+- Microsoft for WSL2 and dxgkrnl.
+- XanMod for its kernel patches and configuration.
+- LLVM/Clang for the compiler toolchain.

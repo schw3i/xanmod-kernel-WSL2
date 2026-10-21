@@ -1,18 +1,25 @@
 name: LTS
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
-    # manual trigger
-  schedule:
-    - cron: '0 0 * * 0' # weekly
+    inputs:
+      arch:
+        description: 'Target CPU architecture'
+        required: false
+        default: 'MZEN3'
+        type: choice
+        options:
+          - MZEN3
+          - GENERIC_CPU3
+          - GENERIC_CPU2
+          - MSKYLAKE
 
 jobs:
   build-lts:
+    permissions:
+      contents: write
     uses: ./.github/workflows/build-core.yml
     with:
       branch: LTS
       version_suffix: lts
+      arch: ${{ inputs.arch || 'MZEN3' }}
